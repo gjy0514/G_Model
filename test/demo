@@ -19,3 +19,1311 @@ from skimage import io
 from torch import nn
 from test.model import Net
 import siamese_net.siam_net as siam
+
+class Extractor(object):
+    def __init__(self, model_path, use_cuda=False):
+        self.net = Net(reid=True)
+        self.device = "cuda" if torch.cuda.is_available() and use_cuda else "cpu"
+        state_dict = torch.load(model_path, map_location='cpu')
+        self.net.load_state_dict(state_dict)
+        print("Loading weights from {}... Done!".format(model_path))
+        self.net.to(self.device)
+        self.norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+    def __call__(self, img):
+        assert isinstance(img, np.ndarray), "type error"
+        img = img.astype(np.float)  # /255.
+        img = cv2.resize(img, (64, 128))
+        img = torch.from_numpy(img).float().permute(2, 0, 1)
+        img = self.norm(img).unsqueeze(0)
+        with torch.no_grad():
+            img = img.to(self.device)
+            feature = self.net(img)
+        return feature.cpu().numpy()
+
+
+def cos_sim(a, b):
+    a_norm = np.linalg.norm(a)
+    b_norm = np.linalg.norm(b)
+    if a_norm == 0 or b_norm == 0:
+        cos = 0
+    else:
+        cos = np.dot(a, b) / (a_norm * b_norm)
+    return cos
+
+
+def Euclidean_Distance(a, b):
+    return math.sqrt(sum(pow(a - b, 2) for a, b in zip(a, b)))
+
+
+def com_M_matrix(Sd, St, Td, Tt, Me):
+    temp1 = np.kron(Sd, St)
+    temp2 = np.kron(Td, Tt)
+    temp2 = temp2.T
+    return np.matmul(product(temp1, Me), temp2)  # np.dot(np.dot(temp1,temp3),temp2)
+
+
+def into0_1(matrix):
+    max_item = np.max(matrix, axis=1)
+    min_item = np.min(matrix, axis=1)
+    for item1 in range(matrix.shape[0]):
+        for item2 in range(matrix.shape[1]):
+            if max_item[item1] - min_item[item1] == 0:
+                matrix[item1][item2] = 0.01
+            else:
+                matrix[item1][item2] = (matrix[item1][item2] - min_item[item1]) / (max_item[item1] - min_item[item1])
+                if matrix[item1][item2] == 1:
+                    matrix[item1][item2] = 0.99
+
+def find_max(ass_matrix, row_index, col_num, row_num):
+    flag = 0
+    row = ass_matrix[row_index]
+    temp = row[0]
+    row_max_index = 0
+    for item in range(row_num):
+        if row[item] > temp:
+            temp = row[item]
+            row_max_index = item
+    col = ass_matrix[:, row_max_index]
+    temp = col[0]
+    col_max_index = 0
+    for item in range(col_num):
+        if col[item] > temp:
+            temp = col[item]
+            col_max_index = item
+    if row_index != col_max_index:
+        flag = 1
+    return row_max_index, flag
+
+def dets_select(dets):
+    dets = dets.tolist()
+    nums = len(dets)
+    item = 0
+    while item < nums:
+        if dets[item][4] < 0.16:  # 0.15
+            dets.remove(dets[item])
+            item -= 1
+            nums -= 1
+        item += 1
+    dets = np.array(dets)
+    return dets
+
+def Bi_Stochastic(ass_matrix, node_1, node_2):
+    vec_1n = np.ones(node_1)
+    vec_1m = np.ones(node_2)
+    for item in range(10):
+        ass_matrix = np.matmul(ass_matrix, np.linalg.inv(np.diag(np.matmul(vec_1n, ass_matrix))))
+        ass_matrix = np.matmul(np.linalg.inv(np.diag(np.matmul(ass_matrix, vec_1m.T))), ass_matrix)
+    return ass_matrix
+
+
+def gradient_descent(M_matrix, node_sim_matrix, node_1, node_2, lr, max_iter):
+    # b, M :函数参数的初始值
+    # lr :学习率
+    # max_iter :迭代次数
+    I_matrix = torch.eye(node_1 * node_2, requires_grad=True)
+    a_matrix = torch.ones(node_1 * node_2, 1, requires_grad=True)
+    node_sim_matrix = node_sim_matrix.reshape(node_1 * node_2, 1)
+    node_sim_matrix = torch.tensor(node_sim_matrix, requires_grad=True, dtype=torch.float32)
+    M_matrix = torch.tensor(M_matrix, requires_grad=True, dtype=torch.float32)
+    for i in range(max_iter):
+        # 计算出前向数值
+        temp1 = torch.mm(a_matrix.t(), (((node_2 - 1) ** 2) * I_matrix - M_matrix))
+        temp2 = torch.mm(temp1, a_matrix)
+        temp3 = torch.mm(node_sim_matrix.t(), a_matrix)
+        output = temp2 - temp3
+        # output = torch.mm(torch.mm(a_matrix.t(),(node_2*I_matrix-M_matrix)),a_matrix)-torch.mm(node_sim_matrix.t(),a_matrix)
+        # output为tensor类型，使用backward方法可以自动反向求导，获得x.grad和y.grad
+        output.backward()
+        # 更新参数
+        a_matrix.data -= lr * a_matrix.grad
+        # 因为每一次更新grad后数值会保存在x和y中，所以要及时将x.grad和y.grad清零
+        # 易错点：当把下面两行代码放置于output.backward()前时，程序会报错
+        #       这是因为在执行backward()方法之前，x.grad和y.grad是两个无类型对象，不具有fill_()方法
+        #       只有在执行过backward()方法之后才会变成tensor类型
+        a_matrix.grad.fill_(0)
+    a_matrix = a_matrix.reshape(node_1, node_2)
+    a_matrix = F.normalize(a_matrix, p=1, dim=1)
+    # a_matrix = a_matrix.numpy()
+    return a_matrix
+
+
+def cal_iou(box1, box2):
+    """
+    :param box1: xyxy 左上右下
+    :param box2: xyxy
+    :return:
+    """
+    x1min, y1min, x1max, y1max = box1[0], box1[1], box1[2], box1[3]
+    x2min, y2min, x2max, y2max = box2[0], box2[1], box2[2], box2[3]
+    # 计算两个框的面积
+    s1 = (y1max - y1min + 1.) * (x1max - x1min + 1.)
+    s2 = (y2max - y2min + 1.) * (x2max - x2min + 1.)
+    # 计算相交部分的坐标
+    xmin = max(x1min, x2min)
+    ymin = max(y1min, y2min)
+    xmax = min(x1max, x2max)
+    ymax = min(y1max, y2max)
+
+    inter_h = max(ymax - ymin + 1, 0)
+    inter_w = max(xmax - xmin + 1, 0)
+
+    intersection = inter_h * inter_w
+    union = s1 + s2 - intersection
+
+    # 计算iou
+    iou = intersection / union
+    return iou
+
+
+def xyxy_to_xywh(xyxy):
+    center_x = (xyxy[0] + xyxy[2]) / 2
+    center_y = (xyxy[1] + xyxy[3]) / 2
+    w = xyxy[2] - xyxy[0]
+    h = xyxy[3] - xyxy[1]
+    return (center_x, center_y, w, h)
+
+
+def xywh_to_xyxy(xywh):
+    x1 = xywh[0] - xywh[2] // 2
+    y1 = xywh[1] - xywh[3] // 2
+    x2 = xywh[0] + xywh[2] // 2
+    y2 = xywh[1] + xywh[3] // 2
+
+    return [x1, y1, x2, y2]
+
+
+def KF(box1, box2):
+    initial_target_box = box1  # 目标初始bouding box
+    initial_box_state = xyxy_to_xywh(initial_target_box)
+    initial_state = np.array([[initial_box_state[0], initial_box_state[1], initial_box_state[2], initial_box_state[3],
+                               0, 0]]).T  # [中心x,中心y,宽w,高h,dx,dy]
+    # ---------状态初始化----------------------------------------
+    X_posterior = np.array(initial_state)
+    P_posterior = np.array(P)
+    Z = np.array(initial_state)
+    target_box = box2
+    xywh = xyxy_to_xywh(target_box)
+    # 计算dx,dy
+    dx = xywh[0] - X_posterior[0]
+    dy = xywh[1] - X_posterior[1]
+    Z[0:4] = np.array([xywh]).T
+    Z[4::] = np.array([dx, dy])
+    # -----进行先验估计-----------------
+    for item in range(100):
+        X_prior = np.dot(A, X_posterior)
+        # box_prior = xywh_to_xyxy(X_prior[0:4])
+        # plot_one_box(box_prior, frame, color=(0, 0, 0), target=False)
+        # -----计算状态估计协方差矩阵P--------
+        P_prior_1 = np.dot(A, P_posterior)
+        P_prior = np.dot(P_prior_1, A.T) + Q
+        # ------计算卡尔曼增益---------------------
+        k1 = np.dot(P_prior, H.T)
+        k2 = np.dot(np.dot(H, P_prior), H.T) + R
+        K = np.dot(k1, np.linalg.inv(k2))
+        # --------------后验估计------------
+        X_posterior_1 = Z - np.dot(H, X_prior)
+        X_posterior = X_prior + np.dot(K, X_posterior_1)
+        # box_posterior = xywh_to_xyxy(X_posterior[0:4])
+        # plot_one_box(box_posterior, frame, color=(255, 255, 255), target=False)
+        # ---------更新状态估计协方差矩阵P-----
+        P_posterior_1 = np.eye(6) - np.dot(K, H)
+        P_posterior = np.dot(P_posterior_1, P_prior)
+    box_posterior = xywh_to_xyxy(X_posterior[0:4])
+    box_posterior = [int(box_posterior[0]), int(box_posterior[1]), int(box_posterior[2]), int(box_posterior[3])]
+    return box_posterior
+
+
+def features_trs(features):
+    siam_tensor = np.empty([1, 10000])
+    fea_temp = copy.deepcopy(features)
+    #fea_temp = np.broadcast_to(fea_temp, (20, 512))
+    fea_temp = np.broadcast_to(fea_temp, (80, 128))
+    fea_temp = fea_temp.reshape((1, -1))
+    siam_tensor[:, :] = fea_temp[:, :10000]
+    siam_tensor = torch.tensor(siam_tensor, dtype=torch.float32)
+    siam_tensor = siam_tensor.reshape(100, 100)
+    siam_tensor = torch.unsqueeze(siam_tensor, 0)
+    siam_tensor = torch.unsqueeze(siam_tensor, 0)
+    return siam_tensor
+
+
+def edge_angle(a, b):
+    x_direction = b[0] - a[0]
+    y_direction = b[1] - a[1]
+    if x_direction > 0:
+        if y_direction < 0:
+            angle = math.degrees(math.atan(abs(y_direction) / x_direction))
+        if y_direction > 0:
+            angle = 270 + math.degrees(math.atan(x_direction / y_direction))
+    if x_direction < 0:
+        if y_direction > 0:
+            angle = 180 + math.degrees(math.atan(y_direction / abs(x_direction)))
+        if y_direction < 0:
+            angle = 90 + math.degrees(math.atan(abs(x_direction) / abs(y_direction)))
+    if x_direction == 0:
+        if y_direction > 0:
+            angle = 270
+        if y_direction < 0:
+            angle = 90
+    if y_direction == 0:
+        if x_direction > 0:
+            angle = 0
+        if x_direction < 0:
+            angle = 180
+    if x_direction == 0 and y_direction == 0:
+        angle = 0
+    return angle
+
+
+def depth_pass(x1, x2, y1, y2, depth_img):
+    value_0 = (depth_img[int((y1 + y2) / 2)][int((x1 + x2) / 2)][0]) / 3
+    value_1 = (depth_img[int((y1 + y2) / 2)][int((x1 + x2) / 2)][1]) / 3
+    value_2 = (depth_img[int((y1 + y2) / 2)][int((x1 + x2) / 2)][2]) / 3
+    return value_0 + value_1 + value_2
+
+
+def product(x1, x2):
+    matrix = np.empty([x1.shape[0], x1.shape[1]], dtype=float)
+    x2 = x2.reshape((1, -1))
+    for item1 in range(x1.shape[0]):
+        for item2 in range(x1.shape[1]):
+            matrix[item1, item2] = x1[item1, item2] * x2[0, item2]
+
+    return matrix
+
+
+if __name__ == '__main__':
+    extr = Extractor("ckpt.t7")
+    sim_net = siam.SiameseNetwork()
+    sim_net.load_state_dict(torch.load('D:/新建文件夹/文献/my_model/test/net_parameters.pkl'))
+    # print(feature.shape)
+
+    A = np.array([[1, 0, 0, 0, 1, 0],
+                  [0, 1, 0, 0, 0, 1],
+                  [0, 0, 1, 0, 0, 0],
+                  [0, 0, 0, 1, 0, 0],
+                  [0, 0, 0, 0, 1, 0],
+                  [0, 0, 0, 0, 0, 1]])
+    H = np.eye(6)
+    Q = np.eye(6) * 0.1
+    R = np.eye(6) * 1
+    B = None
+    P = np.eye(6)
+
+    node_1 = 0
+    trackers = []
+    trackers_temp = []
+    col_list = []
+    tck_num = []
+    trackers_num = 0
+    det_mem_num = 0
+    post_process_ID = []
+    para_sim = 1
+    para_IOU = 0.7
+    lr = 0.00065  # 0.00265
+    max_iter = 6000
+    display = 0
+    colours = np.random.rand(32, 3)  # used only for display
+    font = {'color': 'white',
+            'size': 10
+            }
+    # 'family': 'serif',
+    # 'style': 'italic',
+    # 'weight': 'normal',
+    if (display):
+        plt.ion()
+        fig = plt.figure()
+        ax1 = fig.add_subplot(111, aspect='equal')
+    if not os.path.exists('output'):
+        os.makedirs('output')
+
+    data_path = 'D:/datasets/MOT17/train'
+    img_path = 'D:/datasets/MOT17/train/MOT17-09-SDP/img1'
+    process_seq = 'MOT17-09-SDP'
+    savefig_path = "test_img/MOT17-11-SDP_g/00{}.jpg"
+    # pattern = os.path.join(data_path, '*', 'det', 'det.txt')
+    pattern = os.path.join(data_path, process_seq, 'det', 'det.txt')
+    filenames = os.listdir(img_path)
+
+    for seq_dets_fn in glob.glob(pattern):
+        seq_dets = np.loadtxt(seq_dets_fn, delimiter=',')
+        seq = seq_dets_fn[pattern.find(process_seq):].split(os.path.sep)[0]
+
+        with open(os.path.join('output', '%s.txt' % (seq)), 'w') as out_file:
+            print("Processing %s." % (seq))
+            for frame in range(int(seq_dets[:, 0].max())):
+                ori_img_path = os.path.join(img_path, filenames[frame])
+                ori_img = cv2.imread(ori_img_path)
+                frame += 1  # detection and frame numbers begin at 1
+                # if (frame - 1) % 4 != 0:
+                #   continue
+                if ori_img is None:
+                    print(frame, 'is corrupted')
+                    continue
+                print("Processing frame {}".format(frame))
+                '''
+                dets = seq_dets[seq_dets[:, 0] == frame, 2:10] #x,y,w,h,置信度，丢失后寿命，轨迹号，连续跟踪时长
+                dets= dets_select(dets)
+                '''
+                red_dets = seq_dets[seq_dets[:, 0] == frame, 2:10]  # x,y,w,h,置信度，存在时长，轨迹号，连续跟踪时长
+                dets = np.empty([red_dets.shape[0], 12], dtype=float)
+                dets[:, 0:5] = red_dets
+
+                dets = dets_select(dets)
+
+                if dets.size == 0:
+                    continue
+
+                if (display):
+                    fn = os.path.join(img_path, '%06d.jpg' % (frame))
+                    # fn = os.path.join('D:/datasets/MOT17/train/MOT17-09-DPM/img1','%06d.jpg' % (frame))
+                    im_age = io.imread(fn)
+                    #depth_img = com_depth(im_age)
+                    ax1.imshow(im_age)
+                    plt.title(seq + ' Tracked Targets')
+
+                dets[:, 2:4] += dets[:, 0:2]  # convert to [x1,y1,w,h] to [x1,y1,x2,y2]
+                dets = np.around(dets, 0)
+                node_2 = dets.shape[0]
+                edge_2 = (dets.shape[0] * (dets.shape[0] - 1))//2
+                features_2 = np.empty([node_2, 128], dtype=float)
+                edge_features_2 = np.empty([edge_2, 256], dtype=float)
+                #features_2 = np.empty([node_2, 513], dtype=float)
+                #edge_features_2 = np.empty([edge_2, 1024], dtype=float)
+                edge_add2 = np.empty([edge_2, 2], dtype=float)
+
+                #depth_img = com_depth(ori_img_path)
+
+                for num in range(node_2):
+                    x1, y1, x2, y2 = dets[num, 0:4]
+                    if x1 < 0:
+                        x1 = 0
+                    if y1 < 0:
+                        y1 = 0
+                    im = ori_img[int(y1):int(y2), int(x1):int(x2)]
+                    feature = extr(im)  # [0]
+                    features_2[num, :] = feature
+                    #features_2[num, :512] = feature
+                    #features_2[num][512] = depth_pass(x1, x2, y1, y2, depth_img)
+
+
+
+
+                if node_1 == 1 and node_2 != 1:
+                    dets_list = copy.deepcopy(dets)
+                    dets_list[:, 5] = 1
+                    dets_list = dets_list.tolist()
+                    node_sim_matrix = np.empty([node_1, node_2], dtype=float)
+                    for item_1 in range(features_1.shape[0]):
+                        for item_2 in range(features_2.shape[0]):
+                            siam_tensor1 = features_trs(features_1[item_1, :])
+                            siam_tensor2 = features_trs(features_2[item_2, :])
+                            output1, output2 = sim_net(siam_tensor1, siam_tensor2)
+                            euclidean_distance = F.pairwise_distance(output1, output2)
+                            euclidean_distance = float(euclidean_distance)
+                            node_sim_matrix[item_1, item_2] = 0.3 - euclidean_distance
+                            #depth_sim = abs(0.01 * features_1[item_1][512] - 0.01 * features_2[item_2][512])
+                            node_IOU = cal_iou(dets_list[item_2][0:4], tck_list[item_1][0:4])
+                            node_sim_matrix[item_1, item_2] = para_sim*node_sim_matrix[item_1, item_2] + para_IOU*node_IOU
+                            #node_sim_matrix[item_1, item_2] = 2 * node_sim_matrix[item_1, item_2] + node_IOU - 0.25 * depth_sim
+                            if node_sim_matrix[item_1, item_2] < 0:
+                                node_sim_matrix[item_1, item_2] = 0
+
+                    col_max_index = np.where(node_sim_matrix == np.max(node_sim_matrix, axis=1))
+                    col_max_index = np.array(col_max_index)
+                    for item in range(node_2):
+                        col_list.append(item)
+                    for item in range(trackers_num):
+                        if (operator.eq(trackers[item][0:5], tck_list[0][0:5])):
+                            dets_list[col_max_index[1, 0]][6] =  trackers[item][6] #继承ID
+
+                            trackers[item][7] += 1  # 更新成功跟踪时长
+                            dets_list[col_max_index[1, 0]][7] = trackers[item][7]
+
+                            #trackers[item] = dets_list[col_max_index[1, 0]]  # 轨迹序列更新
+                            bbox_temp = trackers[item][0:4]
+                            trackers[item] = dets_list[col_max_index[1, 0]]  # 轨迹序列更新
+                            trackers[item][8:12] = bbox_temp
+
+                            if trackers[item][7] > 4 and trackers[item][7] not in post_process_ID:
+                                post_process_ID.append(trackers[item][6])
+
+                            trackers_temp[item] = features_2[col_max_index[1, 0]]  # 更新当前轨迹特征库
+
+                            tck_num.append(item)
+                            col_list.remove(col_max_index[1, 0])
+                            break
+
+                    for item in range(trackers_num):
+                        if item not in tck_num:
+                            trackers[item][5] += 1
+                            trackers[item][7] = 1  # 跟踪失败，连续跟踪数置1
+                            if trackers[item][5] <= 5:
+                                dets_list.append(trackers[item])
+                            if trackers[item][8] != 0:
+                                bbox_temp = trackers[item][0:4]
+                                trackers[item][0:4] = KF(trackers[item][8:12],trackers[item][0:4])
+                                trackers[item][8:12] = bbox_temp
+
+                    temp_trackers_num = 0
+                    det_mem_num = 0
+                    features_2_add = []
+                    trackers_temp = np.array(trackers_temp)
+                    while temp_trackers_num < trackers_num:
+                        if trackers[temp_trackers_num][5] > 1 and trackers[temp_trackers_num][5] <= 5:
+                            features_2_add.append(trackers_temp[temp_trackers_num])
+                            det_mem_num += 1
+                        if trackers[temp_trackers_num][5] > 5:
+                            trackers.remove(trackers[temp_trackers_num])
+                            trackers_temp = np.delete(trackers_temp, temp_trackers_num, axis=0)
+                            temp_trackers_num -= 1
+                            trackers_num -= 1
+                        temp_trackers_num += 1
+                    trackers_temp = trackers_temp.tolist()
+
+                    if len(col_list) != 0:
+                        for item in range(len(col_list)):
+                            trackers_num += 1
+                            trackers_num_sum +=1
+                            dets_list[col_list[item]][6] = trackers_num_sum
+                            dets_list[col_list[item]][7] = 1
+                            trackers.append(dets_list[col_list[item]])
+                            trackers[-1][8:12] = [0, 0, 0, 0]
+                            trackers_temp.append(features_2[col_list[item]])
+
+
+
+                    if det_mem_num != 0:
+                        node_2 += det_mem_num
+                        edge_2 = node_2 * (node_2 - 1)
+                        #features_2_temp = np.empty([node_2, 513], dtype=float)
+                        features_2_temp = np.empty([node_2, 128], dtype=float)
+                        features_2_temp[:(node_2 - det_mem_num), :] = features_2[:, :]
+                        features_2_add = np.array(features_2_add)
+                        features_2_temp[(node_2 - det_mem_num):, :] = features_2_add[:det_mem_num, :]
+                        #edge_features_2_temp = np.empty([edge_2, 1024], dtype=float)
+                        edge_features_2_temp = np.empty([edge_2, 256], dtype=float)
+                        edge_add2_temp = np.empty([edge_2, 2], dtype=float)
+                        node_num_1 = 0
+                        node_num_2 = 0
+                        dets_temp = copy.deepcopy(dets_list)
+                        dets_temp = np.array(dets_temp)
+
+                        for edge in range(edge_2):
+                            if node_num_1 == node_num_2:
+                                node_num_2 += 1
+                            edge_features_2_temp[edge, :128] = features_2_temp[node_num_1, :]
+                            edge_features_2_temp[edge, 128:] = features_2_temp[node_num_2, :]
+                            edge_add2_temp[edge, 0] = edge_angle(dets_temp[node_num_1, 0:2], dets_temp[node_num_2, 0:2])
+                            edge_add2_temp[edge, 1] = 0.01 * Euclidean_Distance(dets_temp[node_num_1, 0:2],
+                                                                                dets_temp[node_num_2, 0:2])
+                            node_num_2 += 1
+                            if node_num_2 == dets.shape[0]:
+                                node_num_1 += 1
+                                node_num_2 = 0
+
+                        s2_matrix = np.zeros([node_2, edge_2], dtype=int)
+                        t2_matrix = np.zeros([node_2, edge_2], dtype=int)
+                        for edge in range(edge_2):
+                            for node in range(node_2):
+                                if all(edge_features_2_temp[edge, :128] == features_2_temp[node, :]):
+                                    s2_matrix[node][edge] = 1.
+                                    break
+                        for edge in range(edge_2):
+                            for node in range(node_2):
+                                if all(edge_features_2_temp[edge, 128:] == features_2_temp[node, :]):
+                                    t2_matrix[node][edge] = 1.
+                                    break
+                        features_2 = copy.deepcopy(features_2_temp)
+                        com__edge_features_2 = copy.deepcopy(edge_features_2_temp)
+                        com__edge_features_2[:, :128] = (com__edge_features_2[:, :128] + com__edge_features_2[:, 128:]) / 2
+                        edge_add2 = copy.deepcopy(edge_add2_temp)
+                        s2_matrix = copy.deepcopy(s2_matrix)
+                        t2_matrix = copy.deepcopy(t2_matrix)
+
+                    tck_num = []
+                    col_list = []
+                    '''
+                    trackers_add = []
+                    for item in range(len(trackers)):
+                        for item2 in range(len(trackers_last)):
+                            if (operator.eq(trackers[item][6], trackers_last[item2][6])):
+                                trackers_add.append(trackers[item])
+                                if abs(trackers_add[-1][0] - trackers_last[item1][0]) > 15:
+                                    trackers_add[-1][0] = (trackers_add[-1][0] + trackers_last[item2][0]) / 2
+                                    trackers_add[-1][1] = (trackers_add[-1][1] + trackers_last[item2][1]) / 2
+                                    trackers_add[-1][2] = (trackers_add[-1][2] + trackers_last[item2][2]) / 2
+                                    trackers_add[-1][3] = (trackers_add[-1][3] + trackers_last[item2][3]) / 2
+
+                    trackers_add_array = np.array(trackers_add)
+                    for trc_add in trackers_add_array:
+                        print('%d,%d,%.2f,%.2f,%.2f,%.2f,-1,-1,-1,-1' % (
+                            frame - 2, trc_add[6], trc_add[0], trc_add[1], trc_add[2] - trc_add[0],
+                            trc_add[3] - trc_add[1]), file=out_file)
+                    '''
+                    trackers_array = copy.deepcopy(trackers)
+                    trackers_last = copy.deepcopy(trackers)
+                    trackers_array = np.array(trackers_array)
+
+                    for trc in trackers_array:
+                        print('%d,%d,%.2f,%.2f,%.2f,%.2f,-1,-1,-1,-1' % (
+                            frame, trc[6], trc[0], trc[1], trc[2] - trc[0], trc[3] - trc[1]), file=out_file)
+                        if (display):
+                            trc = trc.astype(np.int32)
+                            plt.text(trc[0], trc[1], trc[6], fontdict=font)
+                            ax1.add_patch(
+                                patches.Rectangle((trc[0], trc[1]), trc[2] - trc[0], trc[3] - trc[1], fill=False, lw=1,
+                                                  ec=colours[trc[4] % 32, :]))
+                            plt.savefig(savefig_path.format(frame))
+
+                    if (display):
+                        fig.canvas.flush_events()
+                        plt.draw()
+                        ax1.cla()
+
+                    tck_list = copy.deepcopy(dets_list)
+                    node_1 = node_2
+                    edge_1 = edge_2
+                    features_1 = copy.deepcopy(features_2)
+                    edge_features_1 = copy.deepcopy(com__edge_features_2)
+                    edge_add1 = copy.deepcopy(edge_add2)
+                    s1_matrix = copy.deepcopy(s2_matrix)
+                    t1_matrix = copy.deepcopy(t2_matrix)
+                    continue
+
+                if node_1 == 1 and node_2 == 1:
+                    dets_list = copy.deepcopy(dets)
+                    dets_list[:, 5] = 1
+                    dets_list = dets_list.tolist()
+                    node_sim_matrix = np.empty([node_1, node_2], dtype=float)
+                    siam_tensor1 = features_trs(features_1[item_1, :])
+                    siam_tensor2 = features_trs(features_2[item_2, :])
+                    output1, output2 = sim_net(siam_tensor1, siam_tensor2)
+                    euclidean_distance = F.pairwise_distance(output1, output2)
+                    euclidean_distance = float(euclidean_distance)
+                    node_sim_matrix[0, 0] = 0.3 - euclidean_distance
+                    #depth_sim = abs(0.01 * features_1[0][512] - 0.01 * features_2[0][512])
+                    node_IOU = cal_iou(dets_list[0][0:4], tck_list[0][0:4])
+                    # node_sim_matrix[item_1, item_2] = para_sim*node_sim_matrix[item_1, item_2] + para_IOU*node_IOU
+                    node_sim_matrix[0, 0] = para_sim * node_sim_matrix[0, 0] + para_IOU * node_IOU
+                    if node_sim_matrix[0, 0] < 0:
+                        node_sim_matrix[0, 0] = 0
+                    #node_sim_matrix[0, 0] = cos_sim(features_1[0, :], features_2[0, :])
+                    # node_sim_matrix[item_1, item_2] = Euclidean_Distance(features_1[item_1, :], features_2[item_2, :])
+                    if node_sim_matrix[0, 0] > 0:
+                        for item in range(trackers_num):
+                            if (operator.eq(trackers[item][0:5], tck_list[0][0:5])):
+                                dets_list[0][6] = trackers[item][6]
+
+                                trackers[item][7] += 1  # 更新成功跟踪时长
+                                dets_list[0][7] = trackers[item][7]
+
+                                #trackers[item] = dets_list[0]  # 轨迹序列更新
+                                bbox_temp = trackers[item][0:4]
+                                trackers[item] = dets_list[0]  # 轨迹序列更新
+                                trackers[item][8:12] = bbox_temp
+
+                                if trackers[item][7] > 4 and trackers[item][7] not in post_process_ID:
+                                    post_process_ID.append(trackers[item][6])
+
+                                trackers_temp[item] = features_2[0]  # 更新当前轨迹特征库
+                                tck_num.append(item)
+                                break
+
+                        for item in range(trackers_num):
+                            if item not in tck_num:
+                                trackers[item][5] += 1
+                                trackers[item][7] = 1  # 跟踪失败，连续跟踪数置1
+                                if trackers[item][5] <= 5:
+                                    dets_list.append(trackers[item])
+                                if trackers[item][8] != 0:
+                                    bbox_temp = trackers[item][0:4]
+                                    trackers[item][0:4] = KF(trackers[item][8:12], trackers[item][0:4])
+                                    trackers[item][8:12] = bbox_temp
+                        temp_trackers_num = 0
+                        det_mem_num = 0
+                        features_2_add = []
+                        trackers_temp = np.array(trackers_temp)
+                        while temp_trackers_num < trackers_num:
+                            if trackers[temp_trackers_num][5] > 1 and trackers[temp_trackers_num][5] <= 5:
+                                features_2_add.append(trackers_temp[temp_trackers_num])
+                                det_mem_num += 1
+                            if trackers[temp_trackers_num][5] > 5:
+                                trackers.remove(trackers[temp_trackers_num])
+                                trackers_temp = np.delete(trackers_temp, temp_trackers_num, axis=0)
+                                temp_trackers_num -= 1
+                                trackers_num -= 1
+                            temp_trackers_num += 1
+                        trackers_temp = trackers_temp.tolist()
+
+                        if det_mem_num != 0:
+                            node_2 += det_mem_num
+                            edge_2 = node_2 * (node_2 - 1)
+                            #features_2_temp = np.empty([node_2, 513], dtype=float)
+                            features_2_temp = np.empty([node_2, 128], dtype=float)
+                            features_2_temp[:(node_2 - det_mem_num), :] = features_2[:, :]
+                            features_2_add = np.array(features_2_add)
+                            features_2_temp[(node_2 - det_mem_num):, :] = features_2_add[:det_mem_num, :]
+                            if node_2 > 1:
+                                #edge_features_2_temp = np.empty([edge_2, 1024], dtype=float)
+                                edge_features_2_temp = np.empty([edge_2, 256], dtype=float)
+                                edge_add2_temp = np.empty([edge_2, 2], dtype=float)
+                                node_num_1 = 0
+                                node_num_2 = 0
+                                dets_temp = copy.deepcopy(dets_list)
+                                dets_temp = np.array(dets_temp)
+                                for edge in range(edge_2):
+                                    if node_num_1 == node_num_2:
+                                        node_num_2 += 1
+                                    edge_features_2_temp[edge, :128] = features_2_temp[node_num_1, :]
+                                    edge_features_2_temp[edge, 128:] = features_2_temp[node_num_2, :]
+                                    edge_add2_temp[edge, 0] = edge_angle(dets_temp[node_num_1, 0:2],
+                                                                         dets_temp[node_num_2, 0:2])
+                                    edge_add2_temp[edge, 1] = 0.01 * Euclidean_Distance(dets_temp[node_num_1, 0:2],
+                                                                                        dets_temp[node_num_2, 0:2])
+                                    node_num_2 += 1
+                                    if node_num_2 == node_2:
+                                        node_num_1 += 1
+                                        node_num_2 = 0
+                                # print(features_2.shape,edge_features_2.shape)
+
+                                s2_matrix = np.zeros([node_2, edge_2], dtype=int)
+                                t2_matrix = np.zeros([node_2, edge_2], dtype=int)
+                                for edge in range(edge_2):
+                                    for node in range(node_2):
+                                        if all(edge_features_2_temp[edge, :128] == features_2_temp[node, :]):
+                                            s2_matrix[node][edge] = 1.
+                                            break
+                                for edge in range(edge_2):
+                                    for node in range(node_2):
+                                        if all(edge_features_2_temp[edge, 128:] == features_2_temp[node, :]):
+                                            t2_matrix[node][edge] = 1.
+                                            break
+                                features_2 = copy.deepcopy(features_2_temp)
+                                com__edge_features_2 = copy.deepcopy(edge_features_2_temp)
+                                com__edge_features_2[:, :128] = (com__edge_features_2[:, :128] + com__edge_features_2[:,128:]) / 2
+                                edge_features_1 = copy.deepcopy(com__edge_features_2)
+                                edge_add2 = copy.deepcopy(edge_add2_temp)
+                                s1_matrix = copy.deepcopy(s2_matrix)
+                                t1_matrix = copy.deepcopy(t2_matrix)
+
+                    else:
+                        trackers_num_sum += 1
+                        dets_list[0][6] = trackers_num_sum
+                        for item in range(trackers_num):
+                            if item not in tck_num:
+                                trackers[item][5] += 1
+                                trackers[item][7] = 1  # 跟踪失败，连续跟踪数置1
+                                if trackers[item][5] <= 5:
+                                    dets_list.append(trackers[item])
+                                if trackers[item][8] != 0:
+                                    bbox_temp = trackers[item][0:4]
+                                    trackers[item][0:4] = KF(trackers[item][8:12], trackers[item][0:4])
+                                    trackers[item][8:12] = bbox_temp
+                        temp_trackers_num = 0
+                        det_mem_num = 0
+                        features_2_add = []
+                        trackers_temp = np.array(trackers_temp)
+                        while temp_trackers_num < trackers_num:
+                            if trackers[temp_trackers_num][5] > 1 and trackers[temp_trackers_num][5] <= 5:
+                                features_2_add.append(trackers_temp[temp_trackers_num])
+                                det_mem_num += 1
+                            if trackers[temp_trackers_num][5] > 5:
+                                trackers.remove(trackers[temp_trackers_num])
+                                trackers_temp = np.delete(trackers_temp, temp_trackers_num, axis=0)
+                                temp_trackers_num -= 1
+                                trackers_num -= 1
+                            temp_trackers_num += 1
+                        trackers_temp = trackers_temp.tolist()
+
+                        if det_mem_num != 0:
+                            node_2 += det_mem_num
+                            edge_2 = node_2 * (node_2 - 1)
+                            features_2_temp = np.empty([node_2, 128], dtype=float)
+                            features_2_temp[:(node_2 - det_mem_num), :] = features_2[:, :]
+                            features_2_add = np.array(features_2_add)
+                            features_2_temp[(node_2 - det_mem_num):, :] = features_2_add[:det_mem_num, :]
+                            if node_2 > 1:
+                                edge_features_2_temp = np.empty([edge_2, 256], dtype=float)
+                                edge_add2_temp = np.empty([edge_2, 2], dtype=float)
+                                node_num_1 = 0
+                                node_num_2 = 0
+                                dets_temp = copy.deepcopy(dets_list)
+                                dets_temp = np.array(dets_temp)
+                                for edge in range(edge_2):
+                                    if node_num_1 == node_num_2:
+                                        node_num_2 += 1
+                                    edge_features_2_temp[edge, :128] = features_2_temp[node_num_1, :]
+                                    edge_features_2_temp[edge, 128:] = features_2_temp[node_num_2, :]
+                                    edge_add2_temp[edge, 0] = edge_angle(dets_temp[node_num_1, 0:2],
+                                                                         dets_temp[node_num_2, 0:2])
+                                    edge_add2_temp[edge, 1] = 0.01 * Euclidean_Distance(dets_temp[node_num_1, 0:2],
+                                                                                        dets_temp[node_num_2, 0:2])
+                                    node_num_2 += 1
+                                    if node_num_2 == node_2:
+                                        node_num_1 += 1
+                                        node_num_2 = 0
+                                # print(features_2.shape,edge_features_2.shape)
+
+                                s2_matrix = np.zeros([node_2, edge_2], dtype=int)
+                                t2_matrix = np.zeros([node_2, edge_2], dtype=int)
+                                for edge in range(edge_2):
+                                    for node in range(node_2):
+                                        if all(edge_features_2_temp[edge, :128] == features_2_temp[node, :]):
+                                            s2_matrix[node][edge] = 1.
+                                            break
+                                for edge in range(edge_2):
+                                    for node in range(node_2):
+                                        if all(edge_features_2_temp[edge, 128:] == features_2_temp[node, :]):
+                                            t2_matrix[node][edge] = 1.
+                                            break
+                                features_2 = copy.deepcopy(features_2_temp)
+                                com__edge_features_2 = copy.deepcopy(edge_features_2_temp)
+                                com__edge_features_2[:, :128] = (com__edge_features_2[:, :128] + com__edge_features_2[:,128:]) / 2
+                                edge_features_1 = copy.deepcopy(com__edge_features_2)
+                                edge_add2 = copy.deepcopy(edge_add2_temp)
+                                s1_matrix = copy.deepcopy(s2_matrix)
+                                t1_matrix = copy.deepcopy(t2_matrix)
+                        trackers.append(dets_list[0])
+                        trackers_temp.append(features_2[0])
+                        trackers[-1][8:12] = [0, 0, 0, 0]
+
+                    tck_num = []
+                    col_list = []
+                    '''
+                    trackers_add = []
+                    for item in range(len(trackers)):
+                        for item2 in range(len(trackers_last)):
+                            if (operator.eq(trackers[item][6], trackers_last[item2][6])):
+                                trackers_add.append(trackers[item])
+                                if abs(trackers_add[-1][0] - trackers_last[item1][0]) > 15:
+                                    trackers_add[-1][0] = (trackers_add[-1][0] + trackers_last[item2][0]) / 2
+                                    trackers_add[-1][1] = (trackers_add[-1][1] + trackers_last[item2][1]) / 2
+                                    trackers_add[-1][2] = (trackers_add[-1][2] + trackers_last[item2][2]) / 2
+                                    trackers_add[-1][3] = (trackers_add[-1][3] + trackers_last[item2][3]) / 2
+                    
+                    trackers_add_array = np.array(trackers_add)
+                    for trc_add in trackers_add_array:
+                        print('%d,%d,%.2f,%.2f,%.2f,%.2f,-1,-1,-1,-1' % (
+                            frame - 2, trc_add[6], trc_add[0], trc_add[1], trc_add[2] - trc_add[0],
+                            trc_add[3] - trc_add[1]), file=out_file)
+                    '''
+                    trackers_array = copy.deepcopy(trackers)
+                    trackers_last = copy.deepcopy(trackers)
+                    trackers_array = np.array(trackers_array)
+
+                    for trc in trackers_array:
+                        print('%d,%d,%.2f,%.2f,%.2f,%.2f,-1,-1,-1,-1' % (
+                            frame, trc[6], trc[0], trc[1], trc[2] - trc[0], trc[3] - trc[1]), file=out_file)
+                        if (display):
+                            trc = trc.astype(np.int32)
+                            plt.text(trc[0], trc[1], trc[6], fontdict=font)
+                            ax1.add_patch(
+                                patches.Rectangle((trc[0], trc[1]), trc[2] - trc[0], trc[3] - trc[1], fill=False, lw=1,
+                                                  ec=colours[trc[4] % 32, :]))
+                            plt.savefig(savefig_path.format(frame))
+
+                    if (display):
+                        fig.canvas.flush_events()
+                        plt.draw()
+                        ax1.cla()
+
+                    tck_list = copy.deepcopy(dets_list)
+                    node_1 = node_2
+                    edge_1 = edge_2
+                    features_1 = copy.deepcopy(features_2)
+                    continue
+
+                if node_1 != 1 and node_2 == 1:
+                    dets_list = copy.deepcopy(dets)
+                    dets_list[:, 5] = 1
+                    dets_list = dets_list.tolist()
+                    node_sim_matrix = np.empty([node_1, node_2], dtype=float)
+                    for item_1 in range(features_1.shape[0]):
+                        for item_2 in range(features_2.shape[0]):
+                            siam_tensor1 = features_trs(features_1[item_1, :])
+                            siam_tensor2 = features_trs(features_2[item_2, :])
+                            output1, output2 = sim_net(siam_tensor1, siam_tensor2)
+                            euclidean_distance = F.pairwise_distance(output1, output2)
+                            euclidean_distance = float(euclidean_distance)
+                            node_sim_matrix[item_1, item_2] = 0.3 - euclidean_distance
+                            #depth_sim = abs(0.01 * features_1[item_1][512] - 0.01 * features_2[item_2][512])
+                            node_IOU = cal_iou(dets_list[item_2][0:4], tck_list[item_1][0:4])
+                            node_sim_matrix[item_1, item_2] =  node_sim_matrix[item_1, item_2] +0.7* node_IOU
+                            if node_sim_matrix[item_1, item_2] < 0:
+                                node_sim_matrix[item_1, item_2] = 0
+                            #node_sim_matrix[item_1, item_2] = cos_sim(features_1[item_1, :], features_2[item_2, :])
+                            #node_sim_matrix[item_1, item_2] = Euclidean_Distance(features_1[item_1, :], features_2[item_2, :])
+                    col_max_index = np.where(node_sim_matrix == np.max(node_sim_matrix,axis=0))
+                    col_max_index = np.array(col_max_index)
+                    for item in range(trackers_num):
+                        if (operator.eq(trackers[item][0:5], tck_list[col_max_index[0,0]][0:5])):
+                            dets_list[0][6] = trackers[item][6]
+
+                            trackers[item][7] += 1  # 更新成功跟踪时长
+                            dets_list[0][7] = trackers[item][7]
+
+                            #trackers[item] = dets_list[0]  # 轨迹序列更新
+                            bbox_temp = trackers[item][0:4]
+                            trackers[item] = dets_list[0]  # 轨迹序列更新
+                            trackers[item][8:12] = bbox_temp
+
+                            if trackers[item][7] > 4 and trackers[item][7] not in post_process_ID:
+                                post_process_ID.append(trackers[item][6])
+
+                            trackers_temp[item] = features_2[0]  # 更新当前轨迹特征库
+                            tck_num.append(item)
+                            break
+                    for item in range(trackers_num):
+                        if item not in tck_num:
+                            trackers[item][5] += 1
+                            trackers[item][7] = 1  # 跟踪失败，连续跟踪数置1
+                            if trackers[item][5] <= 5:
+                                dets_list.append(trackers[item])
+                            if trackers[item][8] != 0:
+                                bbox_temp = trackers[item][0:4]
+                                trackers[item][0:4] = KF(trackers[item][8:12], trackers[item][0:4])
+                                trackers[item][8:12] = bbox_temp
+                    temp_trackers_num = 0
+                    det_mem_num = 0
+                    features_2_add = []
+                    trackers_temp = np.array(trackers_temp)
+                    while temp_trackers_num < trackers_num:
+                        if trackers[temp_trackers_num][5] > 1 and trackers[temp_trackers_num][5] <= 5:
+                            features_2_add.append(trackers_temp[temp_trackers_num])
+                            det_mem_num += 1
+                        if trackers[temp_trackers_num][5] > 5:
+                            trackers.remove(trackers[temp_trackers_num])
+                            trackers_temp = np.delete(trackers_temp, temp_trackers_num, axis=0)
+                            temp_trackers_num -= 1
+                            trackers_num -= 1
+                        temp_trackers_num += 1
+                    trackers_temp = trackers_temp.tolist()
+
+                    if det_mem_num != 0:
+                        node_2 += det_mem_num
+                        edge_2 = node_2 * (node_2 - 1)
+                        features_2_temp = np.empty([node_2, 128], dtype=float)
+                        features_2_temp[:(node_2 - det_mem_num), :] = features_2[:, :]
+                        features_2_add = np.array(features_2_add)
+                        features_2_temp[(node_2 - det_mem_num):, :] = features_2_add[:det_mem_num, :]
+                        edge_features_2_temp = np.empty([edge_2, 256], dtype=float)
+                        edge_add2_temp = np.empty([edge_2, 2], dtype=float)
+                        node_num_1 = 0
+                        node_num_2 = 0
+                        dets_temp = copy.deepcopy(dets_list)
+                        dets_temp = np.array(dets_temp)
+                        for edge in range(edge_2):
+                            if node_num_1 == node_num_2:
+                                node_num_2 += 1
+                            edge_features_2_temp[edge, :128] = features_2_temp[node_num_1, :]
+                            edge_features_2_temp[edge, 128:] = features_2_temp[node_num_2, :]
+                            edge_add2_temp[edge, 0] = edge_angle(dets_temp[node_num_1, 0:2], dets_temp[node_num_2, 0:2])
+                            edge_add2_temp[edge, 1] = 0.01 * Euclidean_Distance(dets_temp[node_num_1, 0:2],
+                                                                                dets_temp[node_num_2, 0:2])
+                            node_num_2 += 1
+                            if node_num_2 == node_2:
+                                node_num_1 += 1
+                                node_num_2 = 0
+                        # print(features_2.shape,edge_features_2.shape)
+
+                        s2_matrix = np.zeros([node_2, edge_2], dtype=int)
+                        t2_matrix = np.zeros([node_2, edge_2], dtype=int)
+                        for edge in range(edge_2):
+                            for node in range(node_2):
+                                if all(edge_features_2_temp[edge, :128] == features_2_temp[node, :]):
+                                    s2_matrix[node][edge] = 1.
+                                    break
+                        for edge in range(edge_2):
+                            for node in range(node_2):
+                                if all(edge_features_2_temp[edge, 128:] == features_2_temp[node, :]):
+                                    t2_matrix[node][edge] = 1.
+                                    break
+                        features_2 = copy.deepcopy(features_2_temp)
+                        com__edge_features_2 = copy.deepcopy(edge_features_2_temp)
+                        com__edge_features_2[:, :128] = (com__edge_features_2[:, :128] + com__edge_features_2[:,128:]) / 2
+                        edge_features_1 = copy.deepcopy(com__edge_features_2)
+                        edge_add2 = copy.deepcopy(edge_add2_temp)
+                        s1_matrix = copy.deepcopy(s2_matrix)
+                        t1_matrix = copy.deepcopy(t2_matrix)
+                    tck_num = []
+                    col_list = []
+                    '''
+                    trackers_add = []
+                    for item in range(len(trackers)):
+                        for item2 in range(len(trackers_last)):
+                            if (operator.eq(trackers[item][6], trackers_last[item2][6])):
+                                trackers_add.append(trackers[item])
+                                if abs(trackers_add[-1][0] - trackers_last[item1][0]) > 15:
+                                    trackers_add[-1][0] = (trackers_add[-1][0] + trackers_last[item2][0]) / 2
+                                    trackers_add[-1][1] = (trackers_add[-1][1] + trackers_last[item2][1]) / 2
+                                    trackers_add[-1][2] = (trackers_add[-1][2] + trackers_last[item2][2]) / 2
+                                    trackers_add[-1][3] = (trackers_add[-1][3] + trackers_last[item2][3]) / 2
+
+                    trackers_add_array = np.array(trackers_add)
+                    for trc_add in trackers_add_array:
+                        print('%d,%d,%.2f,%.2f,%.2f,%.2f,-1,-1,-1,-1' % (
+                            frame - 2, trc_add[6], trc_add[0], trc_add[1], trc_add[2] - trc_add[0],
+                            trc_add[3] - trc_add[1]), file=out_file)
+                    '''
+                    trackers_array = copy.deepcopy(trackers)
+                    trackers_last = copy.deepcopy(trackers)
+                    trackers_array = np.array(trackers_array)
+
+                    for trc in trackers_array:
+                        print('%d,%d,%.2f,%.2f,%.2f,%.2f,-1,-1,-1,-1' % (
+                        frame, trc[6], trc[0], trc[1], trc[2] - trc[0], trc[3] - trc[1]), file=out_file)
+                        if (display):
+                            trc = trc.astype(np.int32)
+                            plt.text(trc[0], trc[1], trc[6], fontdict=font)
+                            ax1.add_patch(
+                                patches.Rectangle((trc[0], trc[1]), trc[2] - trc[0], trc[3] - trc[1], fill=False, lw=1,
+                                                  ec=colours[trc[4] % 32, :]))
+                            plt.savefig(savefig_path.format(frame))
+
+                    if (display):
+                        fig.canvas.flush_events()
+                        plt.draw()
+                        ax1.cla()
+
+                    tck_list = copy.deepcopy(dets_list)
+                    node_1 = node_2
+                    edge_1 = edge_2
+                    features_1 = copy.deepcopy(features_2)
+                    edge_add1 = copy.deepcopy(edge_add2)
+                    continue
+
+
+
+                node_num_1 = 0
+                node_num_2 = 0
+                for edge in range(edge_2):
+                    if node_num_1 == node_num_2:
+                        node_num_2 += 1
+                    #edge_features_2[edge, :512] = features_2[node_num_1, :512]
+                    #edge_features_2[edge, 512:] = features_2[node_num_2, :512]
+                    edge_features_2[edge, :128] = features_2[node_num_1,:]
+                    edge_features_2[edge, 128:] = features_2[node_num_2,:]
+                    edge_add2[edge, 0] = edge_angle(dets[node_num_1, 0:2], dets[node_num_2, 0:2])
+                    edge_add2[edge, 1] = 0.01 * Euclidean_Distance(dets[node_num_1, 0:2], dets[node_num_2, 0:2])
+                    node_num_2 += 1
+                    if node_num_2 == dets.shape[0]:
+                        node_num_1 += 1
+                        node_num_2 = 0
+                # print(features_2.shape,edge_features_2.shape)
+
+                s2_matrix = np.zeros([node_2, edge_2], dtype=int)
+                t2_matrix = np.zeros([node_2, edge_2], dtype=int)
+                for edge in range(edge_2):
+                    for node in range(node_2):
+                        #if all(edge_features_2[edge, :512] == features_2[node, :512]):
+                        if all(edge_features_2[edge, :128] == features_2[node, :]):
+                            s2_matrix[node][edge] = 1.
+                            break
+                for edge in range(edge_2):
+                    for node in range(node_2):
+                        #if all(edge_features_2[edge, 512:] == features_2[node, :512]):
+                        if all(edge_features_2[edge, 128:] == features_2[node, :]):
+                            t2_matrix[node][edge] = 1.
+                            break
+                com__edge_features_2 = copy.deepcopy(edge_features_2)
+                com__edge_features_2[:,:128] = (com__edge_features_2[:,:128] + com__edge_features_2[:,128:])/2
+                dets_list = copy.deepcopy(dets)
+                dets_list[:, 5] = 1
+                dets_list = dets_list.tolist()
+                # features_1_mem = copy.deepcopy(features_1)
+                # features_1_mem = features_1_mem.tolist()
+
+                if frame == 1:
+                    trackers_num = node_2
+                    trackers_num_sum = node_2
+                    for items in range(trackers_num):
+                        trackers.append(dets_list[items])
+                        trackers_temp.append(features_2[items])
+                        trackers[items][6] = items + 1  # 为第一帧分配ID
+                        trackers[items][7] = 1
+                        trackers[items][8:12] = [0, 0, 0, 0]
+
+                if frame > 1:
+                    Me_matrix = np.empty([edge_1, edge_2], dtype=float)
+                    node_sim_matrix = np.empty([node_1, node_2], dtype=float)
+                    trackers_add = []
+
+                    for item_1 in range(edge_features_1.shape[0]):
+                        for item_2 in range(edge_features_2.shape[0]):
+                            # Me_matrix[item_1, item_2] = cos_sim(edge_features_1[item_1, :], edge_features_2[item_2, :])
+                            #Me_matrix[item_1, item_2] = 0.7 - Euclidean_Distance(edge_features_1[item_1, :],edge_features_2[item_2, :])
+                            Me_matrix[item_1, item_2] = 0.7 - Euclidean_Distance(edge_features_1[item_1, :128],
+                                                                                 com__edge_features_2[item_2, :128])
+                            # edge_add = cos_sim(edge_add1[item_1], edge_add2[item_2])
+                            edge_add = Euclidean_Distance(edge_add1[item_1], edge_add2[item_2])
+                            Me_matrix[item_1, item_2] = Me_matrix[item_1, item_2] - 0.01 * edge_add
+                            # Me_matrix[item_1, item_2] = Me_matrix[item_1, item_2] + 0.1*edge_add
+                            if Me_matrix[item_1, item_2] < 0:
+                                Me_matrix[item_1, item_2] = 0
+                            # edge_addwatch = Me_matrix[item_1, item_2]
+                            # watch1 = Me_matrix[item_1, item_2]
+                    for item_1 in range(features_1.shape[0]):
+                        for item_2 in range(features_2.shape[0]):
+                            # node_sim_matrix[item_1, item_2] = cos_sim(features_1[item_1, :], features_2[item_2, :])
+                            # node_sim_matrix[item_1, item_2] =0.6 - Euclidean_Distance(features_1[item_1, :], features_2[item_2, :])
+                            # watch2 = node_sim_matrix[item_1, item_2]
+                            #siam_tensor1 = features_trs(features_1[item_1, :512])
+                            #siam_tensor2 = features_trs(features_2[item_2, :512])
+                            siam_tensor1 = features_trs(features_1[item_1, :])
+                            siam_tensor2 = features_trs(features_2[item_2, :])
+                            output1, output2 = sim_net(siam_tensor1, siam_tensor2)
+                            euclidean_distance = F.pairwise_distance(output1, output2)
+                            euclidean_distance = float(euclidean_distance)
+                            node_sim_matrix[item_1, item_2] = 0.3 - euclidean_distance
+                            watch1 = node_sim_matrix[item_1, item_2]
+                            #depth_sim = abs(0.01 * features_1[item_1][512] - 0.01 * features_2[item_2][512])
+                            node_IOU = cal_iou(dets_list[item_2][0:4], tck_list[item_1][0:4])
+                            node_sim_matrix[item_1, item_2] = para_sim * node_sim_matrix[
+                                item_1, item_2] + para_IOU * node_IOU
+                            # node_sim_matrix[item_1, item_2] = 2*node_sim_matrix[item_1, item_2] + node_IOU - 0.25 * depth_sim
+                            if node_sim_matrix[item_1, item_2] < 0:
+                                node_sim_matrix[item_1, item_2] = 0
+                            # node_sim_matrix[item_1, item_2] = Euclidean_Distance(features_1[item_1, :], features_2[item_2, :])
+
+                    # into0_1(Me_matrix)
+                    # into0_1(node_sim_matrix)
+
+                    # node_sim_matrix = torch.tensor(node_sim_matrix)
+                    # node_sim_matrix = F.normalize(node_sim_matrix, p=1, dim=1)
+                    # node_sim_matrix = np.array(node_sim_matrix)
+                    # print(node_sim_matrix)
+                    M_matrix = com_M_matrix(s2_matrix, s1_matrix, t2_matrix, t1_matrix, Me_matrix)
+                    M_matrix = np.around(M_matrix, 2)
+                    ass_matrix = gradient_descent(M_matrix, node_sim_matrix, node_1, node_2, lr, max_iter)
+                    ass_matrix = ass_matrix.detach().numpy()
+                    ass_matrix = np.around(ass_matrix, 4)
+                    ass_matrix = Bi_Stochastic(ass_matrix, node_1, node_2)
+                    # print(ass_matrix)
+                    row_idx, col_idx = linear_sum_assignment(ass_matrix, maximize=True)
+                    default_match = []
+                    default_match_No = []
+
+                    for item in range(node_2):
+                        col_list.append(item)
+
+                    for item1 in range(min(len(row_idx), len(col_idx))):
+                        for item2 in range(trackers_num):
+                            if (operator.eq(trackers[item2][0:5], tck_list[row_idx[item1]][0:5])):
+
+                                if (abs(trackers[item2][0] - dets_list[col_idx[item1]][0]) > 30):
+                                    default_match.append(dets_list[col_idx[item1]])
+                                    default_match[-1][8:12] = [0, 0, 0, 0]
+                                    default_match_No.append(col_idx[item1])
+                                    continue
+
+                                dets_list[col_idx[item1]][6] = trackers[item2][6]  # 继承ID
+
+                                trackers[item2][7] += 1  # 更新成功跟踪时长
+                                dets_list[col_idx[item1]][7] = trackers[item2][7]
+
+                                bbox_temp = trackers[item2][0:4]
+                                trackers[item2] = dets_list[col_idx[item1]]  # 轨迹序列更新
+                                trackers[item2][8:12] = bbox_temp
+
+                                if trackers[item2][7] > 4 and trackers[item2][7] not in post_process_ID:
+                                    # if trackers[item2][7] > 4 and trackers[item2][7] not in post_process_ID:
+                                    post_process_ID.append(trackers[item2][6])
+
+                                trackers_temp[item2] = features_2[col_idx[item1]]  # 更新当前轨迹特征库
+
+                                tck_num.append(item2)
+                                col_list.remove(col_idx[item1])
+                                break
+
+                    for item in range(trackers_num):
+                        if item not in tck_num and len(default_match) != 0:
+                            max_value = 0
+                            max_flag = 0
+                            for item1 in range(len(default_match)):
+                                temp = cal_iou(trackers[item][0:4], default_match[item1][0:4])
+                                if temp > max_value:
+                                    max_value = temp
+                                    max_flag = item1
+                            if max_value < 0.4:
+                                continue
+                            else:
+                                default_match[max_flag][6] = trackers[item][6]  # 继承ID
+
+                                trackers[item][7] += 1  # 更新成功跟踪时长
+                                default_match[max_flag][7] = trackers[item][7]
+
+                                bbox_temp = trackers[item][0:4]
+                                trackers[item] = default_match[max_flag]  # 轨迹序列更新
+                                trackers[item][8:12] = bbox_temp
+
+                                if trackers[item][7] > 2 and trackers[item][7] not in post_process_ID:
+                                    post_process_ID.append(trackers[item][6])
+                                trackers_temp[item] = features_2[default_match_No[max_flag]]  # 更新当前轨迹特征库
+                                tck_num.append(item)
+                                col_list.remove(default_match_No[max_flag])
+                                default_match.remove(default_match[max_flag])
+                                default_match_No.remove(default_match_No[max_flag])
+
+                    for item in range(trackers_num):
+                        if item not in tck_num:
+                            trackers[item][5] += 1
+                            trackers[item][7] = 1  # 跟踪失败，连续跟踪数置1
+                            if trackers[item][5] <= 3:
+                                # if trackers[item][5] <= 5:
+                                dets_list.append(trackers[item])
+                            if trackers[item][8] != 0:
+                                bbox_temp = trackers[item][0:4]
+                                trackers[item][0:4] = KF(trackers[item][8:12], trackers[item][0:4])
+                                trackers[item][8:12] = bbox_temp
+
+                    temp_trackers_num = 0
+                    det_mem_num = 0
+                    features_2_add = []
+                    trackers_temp = np.array(trackers_temp)
+                    while temp_trackers_num < trackers_num:
+                        if trackers[temp_trackers_num][5] > 1 and trackers[temp_trackers_num][5] <= 3:
+                            # if trackers[temp_trackers_num][5] > 1 and trackers[temp_trackers_num][5] <= 5:
+                            features_2_add.append(trackers_temp[temp_trackers_num])
+                            det_mem_num += 1
+                        if trackers[temp_trackers_num][5] > 3:
+                            # if trackers[temp_trackers_num][5] > 5:
+                            trackers.remove(trackers[temp_trackers_num])
+                            trackers_temp = np.delete(trackers_temp, temp_trackers_num, axis=0)
+                            temp_trackers_num -= 1
+                            trackers_num -= 1
+                        temp_trackers_num += 1
+                    trackers_temp = trackers_temp.tolist()
+
+                    if len(col_list) != 0:
+                        for item in range(len(col_list)):
+                            trackers_num += 1
+                            trackers_num_sum += 1
+                            dets_list[col_list[item]][6] = trackers_num_sum
+                            dets_list[col_list[item]][7] = 0
+                            trackers.append(dets_list[col_list[item]])
+                            trackers[-1][8:12] = [0, 0, 0, 0]
+                            trackers_temp.append(features_2[col_list[item]])
+
+                    if det_mem_num != 0:
+                        node_2 += det_mem_num
+                        edge_2 = node_2 * (node_2 - 1)
+                        #features_2_temp = np.empty([node_2, 513], dtype=float)
+                        features_2_temp = np.empty([node_2, 128], dtype=float)
+                        features_2_temp[:(node_2 - det_mem_num), :] = features_2[:, :]
+                        features_2_add = np.array(features_2_add)
+                        features_2_temp[(node_2 - det_mem_num):, :] = features_2_add[:det_mem_num, :]
+                        #edge_features_2_temp = np.empty([edge_2, 1024], dtype=float)
+                        edge_features_2_temp = np.empty([edge_2, 256], dtype=float)
+                        edge_add2_temp = np.empty([edge_2, 2], dtype=float)
+                        node_num_1 = 0
+                        node_num_2 = 0
+                        dets_temp = copy.deepcopy(dets_list)
+                        dets_temp = np.array(dets_temp)
+                        for edge in range(edge_2):
+                            if node_num_1 == node_num_2:
+                                node_num_2 += 1
+                            #edge_features_2_temp[edge, :512] = features_2_temp[node_num_1, :512]
+                            #edge_features_2_temp[edge, 512:] = features_2_temp[node_num_2, :512]
+                            edge_features_2_temp[edge, :128] = features_2_temp[node_num_1, :]
+                            edge_features_2_temp[edge, 128:] = features_2_temp[node_num_2, :]
+                            edge_add2_temp[edge, 0] = edge_angle(dets_temp[node_num_1, 0:2], dets_temp[node_num_2, 0:2])
+                            edge_add2_temp[edge, 1] = 0.01 * Euclidean_Distance(dets_temp[node_num_1, 0:2],
+                                                                                dets_temp[node_num_2, 0:2])
+                            node_num_2 += 1
+                            if node_num_2 == node_2:
+                                node_num_1 += 1
+                                node_num_2 = 0
+                        # print(features_2.shape,edge_features_2.shape)
+
+                        s2_matrix = np.zeros([node_2, edge_2], dtype=int)
+                        t2_matrix = np.zeros([node_2, edge_2], dtype=int)
+                        for edge in range(edge_2):
+                            for node in range(node_2):
+                                #if all(edge_features_2_temp[edge, :512] == features_2_temp[node, :512]):
+                                if all(edge_features_2_temp[edge, :128] == features_2_temp[node, :]):
+                                    s2_matrix[node][edge] = 1.
+                                    break
+                        for edge in range(edge_2):
+                            for node in range(node_2):
+                                #if all(edge_features_2_temp[edge, 512:] == features_2_temp[node, :512]):
+                                if all(edge_features_2_temp[edge, 128:] == features_2_temp[node, :]):
+                                    t2_matrix[node][edge] = 1.
+                                    break
+                        features_2 = copy.deepcopy(features_2_temp)
+                        #edge_features_2 = copy.deepcopy(edge_features_2_temp)
+                        com__edge_features_2 = copy.deepcopy(edge_features_2_temp)
+                        com__edge_features_2[:, :128] = (com__edge_features_2[:, :128] + com__edge_features_2[:, 128:]) / 2
+                        edge_add2 = copy.deepcopy(edge_add2_temp)
+                        s2_matrix = copy.deepcopy(s2_matrix)
+                        t2_matrix = copy.deepcopy(t2_matrix)
+
+                    col_list = []
+                    tck_num = []
+                    '''
+                    trackers_add = []
+                    for item in range(len(trackers)):
+                        for item2 in range(len(trackers_last)):
+                            if (operator.eq(trackers[item][6], trackers_last[item2][6])):
+                                trackers_add.append(trackers[item])
+                                if abs(trackers_add[-1][0] - trackers_last[item1][0]) > 15:
+                                    trackers_add[-1][0] = (trackers_add[-1][0] + trackers_last[item2][0]) / 2
+                                    trackers_add[-1][1] = (trackers_add[-1][1] + trackers_last[item2][1]) / 2
+                                    trackers_add[-1][2] = (trackers_add[-1][2] + trackers_last[item2][2]) / 2
+                                    trackers_add[-1][3] = (trackers_add[-1][3] + trackers_last[item2][3]) / 2
+
+                    trackers_add_array = np.array(trackers_add)
+                    for trc_add in trackers_add_array:
+                        print('%d,%d,%.2f,%.2f,%.2f,%.2f,-1,-1,-1,-1' % (frame - 2,trc_add[6], trc_add[0], trc_add[1],trc_add[2] - trc_add[0], trc_add[3] - trc_add[1]),file=out_file)
+                    '''
+                trackers_array = copy.deepcopy(trackers)
+                trackers_last = copy.deepcopy(trackers)
+                trackers_array = np.array(trackers_array)
+
+                for trc in trackers_array:
+                    print('%d,%d,%.2f,%.2f,%.2f,%.2f,-1,-1,-1,-1' % (
+                    frame, trc[6], trc[0], trc[1], trc[2] - trc[0], trc[3] - trc[1]), file=out_file)
+                    if (display):
+                        trc = trc.astype(np.int32)
+                        plt.text(trc[0], trc[1], trc[6], fontdict=font)
+                        # verticalalignment = "top", horizontalalignment = "right"
+                        ax1.add_patch(
+                            patches.Rectangle((trc[0], trc[1]), trc[2] - trc[0], trc[3] - trc[1], fill=False, lw=1,
+                                              ec=colours[trc[4] % 32, :]))
+                        plt.savefig(savefig_path.format(frame))
+
+                if (display):
+                    fig.canvas.flush_events()
+                    plt.draw()
+                    ax1.cla()
+
+                tck_list = copy.deepcopy(dets_list)
+                node_1 = node_2
+                edge_1 = edge_2
+                features_1 = copy.deepcopy(features_2)
+                #edge_features_1 = copy.deepcopy(edge_features_2)
+                edge_features_1 = copy.deepcopy(com__edge_features_2)
+                edge_add1 = copy.deepcopy(edge_add2)
+                s1_matrix = copy.deepcopy(s2_matrix)
+                t1_matrix = copy.deepcopy(t2_matrix)
+
+    print("processing res.txt")
+    post_process_ID_nor = []
+    for item in range(trackers_num_sum):
+        item += 1
+        if item not in post_process_ID:
+            post_process_ID_nor.append(item)
+    res_path = "output/MOT17-09-SDP.txt"
+    np.savetxt('post_process_ID.txt', post_process_ID_nor, fmt='%d', delimiter=',', newline='\n')
+    res_np = np.loadtxt(res_path, delimiter=',')
+    res_row_num = res_np.shape[0]
+    for item in post_process_ID_nor:
+        temp = 0
+        while temp < res_row_num:
+            if res_np[temp, 1] == item:
+                res_np = np.delete(res_np, temp, axis=0)
+                temp -= 1
+                res_row_num -= 1
+            temp += 1
+    np.savetxt('MOT17-09-SDPt.txt', res_np, fmt='%d', delimiter=',', newline='\n')
